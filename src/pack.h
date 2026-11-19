@@ -10,7 +10,7 @@ typedef struct zpp_options {
     const char *input_path;
     const char *output_path;   /* may be NULL -> derived */
     int         level;         /* zstd level 1..22 */
-    int         keep_original; /* ZPP_FLAG_KEEP_ORIGINAL */
+    int         strip_metadata; /* --strip-metadata: skip .rsrc copy */
     int         verbose;
 } zpp_options;
 

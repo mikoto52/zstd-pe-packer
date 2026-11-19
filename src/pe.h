@@ -35,6 +35,9 @@ typedef struct zpp_pe {
 
     uint32_t reloc_rva, reloc_size;   /* data directory [BASERELOC] */
     uint32_t import_rva, import_size; /* data directory [IMPORT]    */
+    uint32_t rsrc_rva, rsrc_size;    /* data directory [RESOURCE]  */
+    uint32_t rsrc_file_off;          /* PointerToRawData of .rsrc  */
+    uint32_t rsrc_raw_size;          /* SizeOfRawData of .rsrc     */
 
     /* Offsets into `data` for header fixups when writing the packed file. */
     size_t   nt_headers_off;          /* offset of IMAGE_NT_HEADERS  */

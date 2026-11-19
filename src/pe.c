@@ -99,6 +99,10 @@ int zpp_pe_load(const char *path, zpp_pe *out) {
         out->import_rva = dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
         out->import_size= dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
     }
+    if (num_dirs > IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+        out->rsrc_rva  = dirs[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+        out->rsrc_size = dirs[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+    }
 
     /* TLS callbacks (e.g. Go runtime, some C++): needed by the stub later. */
     if (num_dirs > IMAGE_DIRECTORY_ENTRY_TLS)
@@ -114,6 +118,20 @@ int zpp_pe_load(const char *path, zpp_pe *out) {
     out->kind = (out->com_size != 0) ? ZPP_EXE_DOTNET_MANAGED : ZPP_EXE_NATIVE;
 
     out->section_table_off = opt_off + out->size_of_optional_header;
+
+    /* Find the .rsrc section's raw data location (needed by emitter). */
+    if (out->rsrc_rva) {
+        const IMAGE_SECTION_HEADER *sec =
+            (const IMAGE_SECTION_HEADER *)(out->data + out->section_table_off);
+        for (WORD i = 0; i < out->number_of_sections; i++) {
+            if (sec[i].VirtualAddress == out->rsrc_rva) {
+                out->rsrc_file_off = sec[i].PointerToRawData;
+                out->rsrc_raw_size = sec[i].SizeOfRawData;
+                break;
+            }
+        }
+    }
+
     return 0;
 }
 

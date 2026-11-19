@@ -94,7 +94,7 @@ int zpp_pack(const zpp_options *opt) {
     hdr.magic[0] = ZPP_MAGIC0; hdr.magic[1] = ZPP_MAGIC1;
     hdr.magic[2] = ZPP_MAGIC2; hdr.magic[3] = ZPP_MAGIC3;
     hdr.version          = ZPP_FORMAT_VERSION;
-    hdr.flags            = opt->keep_original ? ZPP_FLAG_KEEP_ORIGINAL : 0;
+    hdr.flags            = opt->strip_metadata ? 0 : ZPP_FLAG_KEEP_ORIGINAL;
     hdr.orig_image_base  = pe.image_base;
     hdr.orig_image_size  = pe.size_of_image;
     hdr.orig_entry_rva   = pe.entry_rva;
@@ -112,6 +112,7 @@ int zpp_pack(const zpp_options *opt) {
     size_t   packed_size = 0;
     if (zpp_emit_packed_pe(zpp_stub_blob, zpp_stub_blob_size,
                            &hdr, comp, comp_size,
+                           opt->strip_metadata ? NULL : &pe,
                            &packed, &packed_size) != 0) {
         fprintf(stderr, "zpp: emitter failed\n");
         free(comp); free(image); zpp_pe_free(&pe);

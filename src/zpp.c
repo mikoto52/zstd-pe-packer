@@ -15,11 +15,11 @@ static void usage(const char *argv0) {
         "ZSTD-PE-Packer v" ZPP_VERSION_STRING "\n"
         "usage: %s [options] <input.exe>\n"
         "\n"
-        "  -o <file>        output path (default: <input>.packed.exe)\n"
-        "  -l <1..22>       zstd compression level (default: 22, max)\n"
-        "  --keep-original  preserve original metadata/hash for transparency\n"
-        "  -v               verbose\n"
-        "  -h, --help       this help\n",
+        "  -o <file>          output path (default: <input>.packed.exe)\n"
+        "  -l <1..22>         zstd compression level (default: 22, max)\n"
+        "  --strip-metadata   do not copy original resources (version/icon/manifest)\n"
+        "  -v                 verbose\n"
+        "  -h, --help         this help\n",
         argv0);
 }
 
@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else if (!strcmp(a, "-v")) { opt.verbose = 1; }
-        else if (!strcmp(a, "--keep-original")) { opt.keep_original = 1; }
+        else if (!strcmp(a, "--strip-metadata")) { opt.strip_metadata = 1; }
         else if (!strcmp(a, "-o")) {
             if (++i >= argc) { fprintf(stderr, "zpp: -o needs an argument\n"); return 2; }
             opt.output_path = argv[i];

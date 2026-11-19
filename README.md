@@ -14,6 +14,7 @@ That's it. Outputs `<input>.exe.packed.exe`.
 |--------|-------------|
 | `-o <file>` | Output path |
 | `-l <1..22>` | Compression level (default: 22, max) |
+| `--strip-metadata` | Don't copy original resources (version/icon/manifest) |
 | `-v` | Verbose |
 
 ## Supported targets
@@ -25,8 +26,9 @@ Managed .NET (CIL) assemblies are detected and refused.
 
 1. `zpp` parses the input PE and maps sections to their virtual layout
 2. The mapped image is compressed with zstd
-3. A tiny no-CRT unpacking stub (44 KB) is combined with the compressed payload into a new PE
-4. At runtime the stub decompresses, applies relocations/imports, sets page protections, and jumps to the original entry point
+3. The original's resource section (version info, icons, manifest) is copied to the output
+4. A tiny no-CRT unpacking stub (44 KB) is combined with the compressed payload into a new PE
+5. At runtime the stub decompresses, applies relocations/imports, sets page protections, and jumps to the original entry point
 
 Command-line arguments pass through transparently.
 
