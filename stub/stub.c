@@ -30,11 +30,19 @@
 #pragma section(".tls$ZZZ", long, read, write)
 
 __declspec(allocate(".tls"))      char _tls_start = 0;
+__declspec(allocate(".tls"))      char _tls_pad[16384] = {0};
 __declspec(allocate(".tls$ZZZ"))  char _tls_end   = 0;
 
 DWORD _tls_index = 0;
 
-static PIMAGE_TLS_CALLBACK _zpp_tls_cbs[] = { NULL };
+/* Globals filled by the main thread's TLS init (step 6) so the TLS
+ * callback can set up proper TLS data for new threads. */
+static const BYTE *g_tls_template_ptr = NULL;
+static SIZE_T      g_tls_template_raw_len = 0;
+static SIZE_T      g_tls_total_len = 0;
+
+static void NTAPI zpp_tls_callback(PVOID, DWORD, PVOID);
+static PIMAGE_TLS_CALLBACK _zpp_tls_cbs[] = { zpp_tls_callback, NULL };
 
 #ifdef _WIN64
 #pragma comment(linker, "/INCLUDE:_tls_used")
@@ -97,6 +105,30 @@ void *memmove(void *dst, const void *src, size_t cnt) {
         while (cnt--) *--d = *--s;
     }
     return dst;
+}
+
+/* ========================================================================= */
+/* TLS callback — runs on every new thread (DLL_THREAD_ATTACH).             */
+/* The Windows loader's internal TLS template copy dates from module load   */
+/* time (the stub's tiny 1-byte template). New threads therefore get a     */
+/* buffer too small for the decompressed image's thread_locals. This       */
+/* callback replaces it with a correctly-sized copy of the original        */
+/* template, so implicit TLS works on all threads.                         */
+/* ========================================================================= */
+
+static void NTAPI zpp_tls_callback(PVOID dll, DWORD reason, PVOID reserved) {
+    (void)dll; (void)reserved;
+    if (reason == DLL_THREAD_ATTACH && g_tls_template_ptr) {
+#ifdef _WIN64
+        BYTE **arr = (BYTE **)(uintptr_t)__readgsqword(0x58);
+#else
+        BYTE **arr = (BYTE **)(uintptr_t)__readfsdword(0x2C);
+#endif
+        if (arr && arr[_tls_index]) {
+            memcpy(arr[_tls_index],
+                   g_tls_template_ptr, g_tls_template_raw_len);
+        }
+    }
 }
 
 /* ========================================================================= */
@@ -360,7 +392,7 @@ static int unpack_and_run(const zpp_header_t *hdr) {
 #endif
 
     /* 6. Initialize TLS: copy template data into the stub's loader-assigned
-     *    TLS slot, update the index, then invoke TLS callbacks. */
+     *    TLS slot, update the index. */
     {
         IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
         IMAGE_NT_HEADERS *img_nt =
@@ -398,40 +430,80 @@ static int unpack_and_run(const zpp_header_t *hdr) {
             size_t raw_len = (size_t)(
                 tls->EndAddressOfRawData - tls->StartAddressOfRawData);
             size_t total_len = raw_len + tls->SizeOfZeroFill;
-            if (total_len > 0) {
-                BYTE *tls_data = (BYTE *)HeapAlloc(
-                    GetProcessHeap(), HEAP_ZERO_MEMORY, total_len);
-                if (tls_data) {
-                    if (raw_len > 0)
-                        memcpy(tls_data,
-                               (const void *)(uintptr_t)
-                                   tls->StartAddressOfRawData,
-                               raw_len);
+            {
 #ifdef _WIN64
-                    BYTE **tls_array =
-                        (BYTE **)(uintptr_t)__readgsqword(0x58);
+                BYTE **tls_array =
+                    (BYTE **)(uintptr_t)__readgsqword(0x58);
 #else
-                    BYTE **tls_array =
-                        (BYTE **)(uintptr_t)__readfsdword(0x2C);
+                BYTE **tls_array =
+                    (BYTE **)(uintptr_t)__readfsdword(0x2C);
 #endif
-                    if (tls_array) {
-                        tls_array[stub_idx] = tls_data;
-                    }
+                if (tls_array && tls_array[stub_idx] && raw_len > 0) {
+                    memcpy(tls_array[stub_idx],
+                           (const void *)(uintptr_t)
+                               tls->StartAddressOfRawData,
+                           raw_len);
                 }
             }
 
             *(DWORD *)(uintptr_t)tls->AddressOfIndex = stub_idx;
 
-            PIMAGE_TLS_CALLBACK *cb =
-                (PIMAGE_TLS_CALLBACK *)(uintptr_t)tls->AddressOfCallBacks;
-            if (cb) {
-                while (*cb) {
-                    (*cb)((PVOID)image, DLL_PROCESS_ATTACH, NULL);
-                    cb++;
-                }
+            /* Publish template info so the stub's TLS callback
+             * (zpp_tls_callback) can set up proper TLS for new threads. */
+            g_tls_template_ptr     = (const BYTE *)(uintptr_t)
+                                         tls->StartAddressOfRawData;
+            g_tls_template_raw_len = raw_len;
+            g_tls_total_len        = total_len;
+
+            /* Update _tls_used so anything that reads it at runtime
+             * sees the decompressed image's template, not the stub's. */
+            {
+                DWORD old_prot;
+                VirtualProtect((void *)&_tls_used, sizeof(_tls_used),
+                               PAGE_READWRITE, &old_prot);
+                IMAGE_TLS_DIRECTORY *stub_tls =
+                    (IMAGE_TLS_DIRECTORY *)(uintptr_t)&_tls_used;
+                stub_tls->StartAddressOfRawData = tls->StartAddressOfRawData;
+                stub_tls->EndAddressOfRawData   = tls->EndAddressOfRawData;
+                stub_tls->SizeOfZeroFill        = tls->SizeOfZeroFill;
+                VirtualProtect((void *)&_tls_used, sizeof(_tls_used),
+                               old_prot, &old_prot);
             }
+
+            tls->AddressOfCallBacks = 0;
         }
     }
+
+    /* 6b. Erase the TLS DataDirectory entry in the decompressed image's
+     *     PE headers so the loader never processes it as a TLS-bearing
+     *     module (we already migrated everything into the stub's slot). */
+#ifdef _WIN64
+    {
+        IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
+        IMAGE_NT_HEADERS64 *img_nt64 =
+            (IMAGE_NT_HEADERS64 *)(image + img_dos->e_lfanew);
+        if (img_nt64->OptionalHeader.NumberOfRvaAndSizes >
+            IMAGE_DIRECTORY_ENTRY_TLS) {
+            img_nt64->OptionalHeader.DataDirectory
+                [IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress = 0;
+            img_nt64->OptionalHeader.DataDirectory
+                [IMAGE_DIRECTORY_ENTRY_TLS].Size = 0;
+        }
+    }
+#else
+    {
+        IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
+        IMAGE_NT_HEADERS32 *img_nt32 =
+            (IMAGE_NT_HEADERS32 *)(image + img_dos->e_lfanew);
+        if (img_nt32->OptionalHeader.NumberOfRvaAndSizes >
+            IMAGE_DIRECTORY_ENTRY_TLS) {
+            img_nt32->OptionalHeader.DataDirectory
+                [IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress = 0;
+            img_nt32->OptionalHeader.DataDirectory
+                [IMAGE_DIRECTORY_ENTRY_TLS].Size = 0;
+        }
+    }
+#endif
 
     /* 7. Initialize security cookie (/GS) from the Load Configuration
      *    Directory. The Windows loader normally does this, but we bypass it. */
@@ -474,6 +546,30 @@ static int unpack_and_run(const zpp_header_t *hdr) {
                                NULL, OPEN_EXISTING, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     }
+
+    /* 8b. Patch PEB and LDR so the OS and runtime see the unpacked image
+     *     as the main module (GetModuleHandle, FindResource, etc.). */
+#ifdef _WIN64
+    {
+        BYTE *peb = (BYTE *)(uintptr_t)__readgsqword(0x60);
+        *(ULONGLONG *)(peb + 0x10) = (ULONGLONG)(uintptr_t)image;
+        BYTE *ldr = *(BYTE **)(peb + 0x18);
+        BYTE *first = *(BYTE **)(ldr + 0x10);
+        *(ULONGLONG *)(first + 0x30) = (ULONGLONG)(uintptr_t)image;
+        *(ULONGLONG *)(first + 0x38) = (ULONGLONG)(uintptr_t)(image + hdr->orig_entry_rva);
+        *(ULONG     *)(first + 0x40) = (ULONG)hdr->orig_image_size;
+    }
+#else
+    {
+        BYTE *peb = (BYTE *)(uintptr_t)__readfsdword(0x30);
+        *(DWORD *)(peb + 0x08) = (DWORD)(uintptr_t)image;
+        BYTE *ldr = *(BYTE **)(peb + 0x0C);
+        BYTE *first = *(BYTE **)(ldr + 0x0C);
+        *(DWORD *)(first + 0x18) = (DWORD)(uintptr_t)image;
+        *(DWORD *)(first + 0x1C) = (DWORD)(uintptr_t)(image + hdr->orig_entry_rva);
+        *(DWORD *)(first + 0x20) = (DWORD)hdr->orig_image_size;
+    }
+#endif
 
     /* 9. Transfer control to the original entry point. */
     entry_point_fn oep = (entry_point_fn)(image + hdr->orig_entry_rva);
