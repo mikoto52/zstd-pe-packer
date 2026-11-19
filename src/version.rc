@@ -1,0 +1,29 @@
+#include <windows.h>
+#include "format.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    ZPP_VERSION_MAJOR, ZPP_VERSION_MINOR, ZPP_VERSION_PATCH, 0
+ PRODUCTVERSION ZPP_VERSION_MAJOR, ZPP_VERSION_MINOR, ZPP_VERSION_PATCH, 0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "zpp - ZSTD PE Packer"
+            VALUE "FileVersion",      ZPP_VERSION_STRING
+            VALUE "ProductName",      "zpp"
+            VALUE "ProductVersion",   ZPP_VERSION_STRING
+            VALUE "LegalCopyright",   "Copyright(C) 2026 AKIRA. All rights reserved."
+            VALUE "OriginalFilename", "zpp.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

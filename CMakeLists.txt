@@ -41,6 +41,7 @@ add_executable(zpp
     src/pe.c
     src/pack.c
     src/emit.c
+    src/version.rc
 )
 target_include_directories(zpp PRIVATE
     src
