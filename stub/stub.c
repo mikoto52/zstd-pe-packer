@@ -20,6 +20,43 @@
 #include <windows.h>
 
 /* ========================================================================= */
+/* Stub TLS directory — ensures the Windows loader allocates an implicit     */
+/* TLS slot for the main module. Without this, any packed executable that    */
+/* uses __declspec(thread) / thread_local (Rust, Go, modern C++) would      */
+/* crash because the TLS array wouldn't have an entry for the main module.  */
+/* ========================================================================= */
+
+#pragma section(".tls",     long, read, write)
+#pragma section(".tls$ZZZ", long, read, write)
+
+__declspec(allocate(".tls"))      char _tls_start = 0;
+__declspec(allocate(".tls$ZZZ"))  char _tls_end   = 0;
+
+DWORD _tls_index = 0;
+
+static PIMAGE_TLS_CALLBACK _zpp_tls_cbs[] = { NULL };
+
+#ifdef _WIN64
+#pragma comment(linker, "/INCLUDE:_tls_used")
+extern const IMAGE_TLS_DIRECTORY64 _tls_used = {
+    (ULONGLONG)(ULONG_PTR)&_tls_start,
+    (ULONGLONG)(ULONG_PTR)&_tls_end,
+    (ULONGLONG)(ULONG_PTR)&_tls_index,
+    (ULONGLONG)(ULONG_PTR)&_zpp_tls_cbs,
+    0, 0
+};
+#else
+#pragma comment(linker, "/INCLUDE:__tls_used")
+extern const IMAGE_TLS_DIRECTORY32 _tls_used = {
+    (ULONG)(ULONG_PTR)&_tls_start,
+    (ULONG)(ULONG_PTR)&_tls_end,
+    (ULONG)(ULONG_PTR)&_tls_index,
+    (ULONG)(ULONG_PTR)&_zpp_tls_cbs,
+    0, 0
+};
+#endif
+
+/* ========================================================================= */
 /* Minimal CRT replacements (no-CRT build has no memcpy/memset).             */
 /* ========================================================================= */
 
@@ -85,7 +122,7 @@ static DWORD section_protect(DWORD ch) {
     int r = (ch & IMAGE_SCN_MEM_READ)    != 0;
     int w = (ch & IMAGE_SCN_MEM_WRITE)   != 0;
     int x = (ch & IMAGE_SCN_MEM_EXECUTE) != 0;
-    if (x && w) return PAGE_EXECUTE_READWRITE;  /* rare but respect it */
+    if (x && w) return PAGE_EXECUTE_READWRITE;
     if (x && r) return PAGE_EXECUTE_READ;
     if (x)      return PAGE_EXECUTE_READ;
     if (w)      return PAGE_READWRITE;
@@ -112,7 +149,6 @@ static const zpp_header_t *find_payload(HMODULE self) {
         if (name_eq(sec[i].Name, ZPP_SECTION_NAME)) {
             const zpp_header_t *hdr =
                 (const zpp_header_t *)(base + sec[i].VirtualAddress);
-            /* Validate magic. */
             if (hdr->magic[0] == ZPP_MAGIC0 && hdr->magic[1] == ZPP_MAGIC1 &&
                 hdr->magic[2] == ZPP_MAGIC2 && hdr->magic[3] == ZPP_MAGIC3 &&
                 hdr->version  == ZPP_FORMAT_VERSION)
@@ -152,7 +188,7 @@ static void apply_relocations(BYTE *image, uint64_t actual_base,
 
             switch (type) {
             case IMAGE_REL_BASED_ABSOLUTE:
-                break; /* padding, skip */
+                break;
             case IMAGE_REL_BASED_HIGHLOW:
                 *(uint32_t *)patch += (uint32_t)delta;
                 break;
@@ -160,7 +196,7 @@ static void apply_relocations(BYTE *image, uint64_t actual_base,
                 *(uint64_t *)patch += (uint64_t)delta;
                 break;
             default:
-                break; /* ignore unknown types */
+                break;
             }
         }
         reloc += block->SizeOfBlock;
@@ -182,11 +218,6 @@ static int resolve_imports(BYTE *image, const zpp_header_t *hdr) {
         HMODULE dll = LoadLibraryA(dll_name);
         if (!dll) return -1;
 
-        /*
-         * OriginalFirstThunk (ILT/HNT) holds the lookup entries.
-         * FirstThunk (IAT) is what we fill with resolved addresses.
-         * If OriginalFirstThunk is 0 (some linkers), use FirstThunk for both.
-         */
         BYTE *ilt_base = image + (imp->OriginalFirstThunk
                                   ? imp->OriginalFirstThunk
                                   : imp->FirstThunk);
@@ -250,7 +281,6 @@ static void apply_section_protections(BYTE *image) {
         VirtualProtect(image + sec[i].VirtualAddress, size, prot, &old);
     }
 
-    /* Mark headers read-only. */
     VirtualProtect(image, nt->OptionalHeader.SizeOfHeaders,
                    PAGE_READONLY, &old);
 }
@@ -262,7 +292,7 @@ static void apply_section_protections(BYTE *image) {
 typedef void (*entry_point_fn)(void);
 
 static int unpack_and_run(const zpp_header_t *hdr) {
-    const BYTE *comp_data = (const BYTE *)(hdr + 1); /* payload follows header */
+    const BYTE *comp_data = (const BYTE *)(hdr + 1);
 
     /* 1. Allocate RW memory for the decompressed image.
      *    Try the original base first so relocations may be skipped. */
@@ -273,7 +303,6 @@ static int unpack_and_run(const zpp_header_t *hdr) {
         PAGE_READWRITE);
 
     if (!image) {
-        /* Original base taken; let the OS pick and we'll relocate. */
         image = (BYTE *)VirtualAlloc(
             NULL,
             hdr->orig_image_size,
@@ -306,16 +335,150 @@ static int unpack_and_run(const zpp_header_t *hdr) {
         return -1;
     }
 
-    /* 5. Set per-section page protections (RX for code, RW for data). */
+    /* 5. Register exception handlers (.pdata) so SEH unwinding works.
+     *    On x64, without this any C++ exception or SEH causes a crash. */
+#ifdef _WIN64
+    {
+        IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
+        IMAGE_NT_HEADERS64 *img_nt =
+            (IMAGE_NT_HEADERS64 *)(image + img_dos->e_lfanew);
+        if (img_nt->OptionalHeader.NumberOfRvaAndSizes >
+            IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+            DWORD exc_rva  = img_nt->OptionalHeader.DataDirectory
+                                 [IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+            DWORD exc_size = img_nt->OptionalHeader.DataDirectory
+                                 [IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+            if (exc_rva && exc_size) {
+                RUNTIME_FUNCTION *funcs =
+                    (RUNTIME_FUNCTION *)(image + exc_rva);
+                DWORD count = exc_size / (DWORD)sizeof(RUNTIME_FUNCTION);
+                RtlAddFunctionTable(funcs, count,
+                                    (DWORD64)(uintptr_t)image);
+            }
+        }
+    }
+#endif
+
+    /* 6. Initialize TLS: copy template data into the stub's loader-assigned
+     *    TLS slot, update the index, then invoke TLS callbacks. */
+    {
+        IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
+        IMAGE_NT_HEADERS *img_nt =
+            (IMAGE_NT_HEADERS *)(image + img_dos->e_lfanew);
+        DWORD tls_rva  = 0, tls_size = 0;
+#ifdef _WIN64
+        {
+            IMAGE_NT_HEADERS64 *nt64 = (IMAGE_NT_HEADERS64 *)img_nt;
+            if (nt64->OptionalHeader.NumberOfRvaAndSizes >
+                IMAGE_DIRECTORY_ENTRY_TLS) {
+                tls_rva  = nt64->OptionalHeader.DataDirectory
+                               [IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                tls_size = nt64->OptionalHeader.DataDirectory
+                               [IMAGE_DIRECTORY_ENTRY_TLS].Size;
+            }
+        }
+#else
+        {
+            IMAGE_NT_HEADERS32 *nt32 = (IMAGE_NT_HEADERS32 *)img_nt;
+            if (nt32->OptionalHeader.NumberOfRvaAndSizes >
+                IMAGE_DIRECTORY_ENTRY_TLS) {
+                tls_rva  = nt32->OptionalHeader.DataDirectory
+                               [IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                tls_size = nt32->OptionalHeader.DataDirectory
+                               [IMAGE_DIRECTORY_ENTRY_TLS].Size;
+            }
+        }
+#endif
+        if (tls_rva && tls_size) {
+            IMAGE_TLS_DIRECTORY *tls =
+                (IMAGE_TLS_DIRECTORY *)(image + tls_rva);
+
+            DWORD stub_idx = _tls_index;
+
+            size_t raw_len = (size_t)(
+                tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+            size_t total_len = raw_len + tls->SizeOfZeroFill;
+            if (total_len > 0) {
+                BYTE *tls_data = (BYTE *)HeapAlloc(
+                    GetProcessHeap(), HEAP_ZERO_MEMORY, total_len);
+                if (tls_data) {
+                    if (raw_len > 0)
+                        memcpy(tls_data,
+                               (const void *)(uintptr_t)
+                                   tls->StartAddressOfRawData,
+                               raw_len);
+#ifdef _WIN64
+                    BYTE **tls_array =
+                        (BYTE **)(uintptr_t)__readgsqword(0x58);
+#else
+                    BYTE **tls_array =
+                        (BYTE **)(uintptr_t)__readfsdword(0x2C);
+#endif
+                    if (tls_array) {
+                        tls_array[stub_idx] = tls_data;
+                    }
+                }
+            }
+
+            *(DWORD *)(uintptr_t)tls->AddressOfIndex = stub_idx;
+
+            PIMAGE_TLS_CALLBACK *cb =
+                (PIMAGE_TLS_CALLBACK *)(uintptr_t)tls->AddressOfCallBacks;
+            if (cb) {
+                while (*cb) {
+                    (*cb)((PVOID)image, DLL_PROCESS_ATTACH, NULL);
+                    cb++;
+                }
+            }
+        }
+    }
+
+    /* 7. Initialize security cookie (/GS) from the Load Configuration
+     *    Directory. The Windows loader normally does this, but we bypass it. */
+#ifdef _WIN64
+    {
+        IMAGE_DOS_HEADER *img_dos = (IMAGE_DOS_HEADER *)image;
+        IMAGE_NT_HEADERS64 *img_nt =
+            (IMAGE_NT_HEADERS64 *)(image + img_dos->e_lfanew);
+        if (img_nt->OptionalHeader.NumberOfRvaAndSizes >
+            IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) {
+            DWORD lc_rva = img_nt->OptionalHeader.DataDirectory
+                               [IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+            if (lc_rva) {
+                IMAGE_LOAD_CONFIG_DIRECTORY64 *lc =
+                    (IMAGE_LOAD_CONFIG_DIRECTORY64 *)(image + lc_rva);
+                if (lc->SecurityCookie) {
+                    DWORD64 *cookie = (DWORD64 *)(uintptr_t)lc->SecurityCookie;
+                    LARGE_INTEGER pc;
+                    QueryPerformanceCounter(&pc);
+                    DWORD64 val = pc.QuadPart;
+                    val ^= GetCurrentProcessId();
+                    val ^= GetCurrentThreadId();
+                    val ^= (DWORD64)(uintptr_t)&val;
+                    if (val == 0x2B992DDFA232ULL) val++;
+                    if ((val & 0x0000FFFFFFFFFFFFULL) == 0) val = 0x2B992DDFA233ULL;
+                    *cookie = val;
+                }
+            }
+        }
+    }
+#endif
+
+    /* 8. Set per-section page protections (RX for code, RW for data). */
     apply_section_protections(image);
 
-    /* 6. Transfer control to the original entry point.
-     *    The OS command line and environment are untouched — arguments passed
-     *    to the packed executable reach the original program unchanged. */
+    /* 8a. Touch the file system API so internal NT state is initialized.
+     *     Without this, some runtimes (Rust/Tauri) crash on startup. */
+    {
+        HANDLE h = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+
+    /* 9. Transfer control to the original entry point. */
     entry_point_fn oep = (entry_point_fn)(image + hdr->orig_entry_rva);
     oep();
 
-    /* Normally the OEP never returns, but if it does: */
     return 0;
 }
 
